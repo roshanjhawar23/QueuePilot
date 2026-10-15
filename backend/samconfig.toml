@@ -1,0 +1,21 @@
+# AWS SAM CLI configuration for QueuePilot.
+# Contains NO credentials and NO secrets. The DemoToken parameter is typed at deploy time by
+# scripts/deploy-backend.ps1 and is never written to this file.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "queuepilot-dev"
+
+[default.deploy.parameters]
+region = "us-east-1"
+template_file = "template.yaml"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true                 # SAM creates/uses its own managed bucket for code packages
+s3_prefix = "queuepilot-dev"
+confirm_changeset = true          # always show the change set and ask before applying it
+fail_on_empty_changeset = false
+tags = "Project=QueuePilot Env=dev ManagedBy=SAM"
+
+[default.validate.parameters]
+lint = true
+region = "us-east-1"

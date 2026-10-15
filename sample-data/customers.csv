@@ -1,0 +1,9 @@
+customer_id,name,email,age,signup_date,plan,monthly_spend
+C001,Ana Lima,ana@example.com,34,2026-01-15,pro,49.00
+C002,Raj Patel,raj.patel@example,29,2026-02-30,basic,9.99
+C003,,li.wei@example.com,41,2026-03-02,enterprise,499
+C004,Sam Ortiz,sam@example.com,17,2026-04-11,pro,49
+C005,Kim Lee,kim@example.com,abc,2026-05-20,gold,12.5
+C006,Noah Brown,noah@example.com,52,2026-06-01,basic,-5
+C007,Mia Chen,mia@example.com,38,2026-07-19,pro,49.00
+,Zoe King,zoe@example.com,45,2026-08-08,basic,9.99

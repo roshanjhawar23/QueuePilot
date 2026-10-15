@@ -1,0 +1,41 @@
+[
+  {
+    "orderId": "A-1",
+    "customer": "C001",
+    "total": 120.5,
+    "currency": "USD",
+    "paid": true,
+    "placedAt": "2026-09-01"
+  },
+  {
+    "orderId": "A-2",
+    "customer": "C002",
+    "total": "80",
+    "currency": "USD",
+    "paid": "yes",
+    "placedAt": "2026-09-02"
+  },
+  {
+    "orderId": "A-3",
+    "total": -10,
+    "currency": "EUR",
+    "paid": false,
+    "placedAt": "not-a-date"
+  },
+  {
+    "orderId": "A-4",
+    "customer": "C004",
+    "total": 15000,
+    "currency": "GBP",
+    "paid": true,
+    "placedAt": "2026-09-04"
+  },
+  {
+    "orderId": "A-5",
+    "customer": "C005",
+    "total": 42,
+    "currency": "USD",
+    "paid": true,
+    "placedAt": "2026-09-05"
+  }
+]

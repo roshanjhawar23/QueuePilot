@@ -1,0 +1,32 @@
+{
+  "name": "queuepilot",
+  "private": true,
+  "version": "0.1.0",
+  "description": "QueuePilot - cloud-native asynchronous file-processing and failure-recovery platform (AWS serverless)",
+  "workspaces": [
+    "shared",
+    "backend",
+    "frontend"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "test": "npm run test --workspaces --if-present",
+    "build": "npm run build -w backend && npm run build -w frontend",
+    "validate:template": "sam validate --lint --template-file backend/template.yaml --region us-east-1",
+    "check": "npm run typecheck && npm run lint && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^22.19.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.0.0",
+    "globals": "^16.5.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.0"
+  },
+  "type": "module"
+}

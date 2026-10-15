@@ -1,0 +1,39 @@
+{
+  "rules": [
+    {
+      "field": "orderId",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "field": "customer",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "field": "total",
+      "required": true,
+      "type": "number",
+      "min": 0,
+      "max": 10000
+    },
+    {
+      "field": "currency",
+      "required": true,
+      "allowedValues": [
+        "USD",
+        "EUR"
+      ]
+    },
+    {
+      "field": "paid",
+      "required": true,
+      "type": "boolean"
+    },
+    {
+      "field": "placedAt",
+      "required": true,
+      "type": "date"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+.aws-sam/
+*.log
+.env
+.env.*
+!.env.example
+frontend/.env.local
+backend/samconfig.local.toml
+backend/e2e.config.json
+.DS_Store
+Thumbs.db

@@ -1,0 +1,550 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  QueuePilot - asynchronous file-processing and failure-recovery platform.
+  API Gateway (HTTP API) + Lambda + SQS (with dead-letter queue) + DynamoDB + S3 + CloudWatch.
+  All resources are serverless and pay-per-use: there is no idle cost.
+
+# -----------------------------------------------------------------------------
+# Parameters you supply at deploy time. NEVER put the demo token in samconfig.toml.
+# -----------------------------------------------------------------------------
+Parameters:
+  DemoToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9_\-\.]+$'
+    ConstraintDescription: 16-128 characters; letters, digits, '-', '_' or '.'.
+    Description: Shared demo access token. Callers send "Authorization Bearer <token>". Typed at deploy time; never stored in code.
+  EnableWebsite:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Host the React build on an S3 static website (public-read bucket). Set to false if your account blocks public buckets; then run the UI locally.
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for CloudWatch alarm notifications (creates an SNS topic; you must confirm the subscription email).
+
+Conditions:
+  WebsiteEnabled: !Equals [!Ref EnableWebsite, 'true']
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]       # Graviton: ~20% cheaper per GB-second than x86
+    Handler: index.handler
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+
+Resources:
+  # ===========================================================================
+  # Amazon S3 - uploaded files, results and backup snapshots
+  # ===========================================================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }   # SSE-S3: free, no KMS key cost
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-inputs, Status: Enabled, Prefix: inputs/, ExpirationInDays: 3 }
+          - { Id: expire-outputs, Status: Enabled, Prefix: outputs/, ExpirationInDays: 3 }
+          - { Id: expire-backups, Status: Enabled, Prefix: backups/, ExpirationInDays: 30 }
+          - { Id: abort-incomplete-uploads, Status: Enabled, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST, GET, HEAD]
+            AllowedOrigins: ['http://localhost:5173', 'http://localhost:4173', !GetAtt WebsiteBucket.WebsiteURL]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt DataBucket.Arn, !Sub '${DataBucket.Arn}/*']
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
+  # The bucket always exists (an empty bucket costs nothing); it is made PUBLIC only when EnableWebsite=true.
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html     # lets React Router handle deep links
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: !If [WebsiteEnabled, false, true]       # must be false for a public static website
+        RestrictPublicBuckets: !If [WebsiteEnabled, false, true]
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WebsiteEnabled
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadForStaticWebsite
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+
+  # ===========================================================================
+  # Amazon DynamoDB - job records, timelines, idempotency keys, backup metadata
+  # ===========================================================================
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST     # on-demand: pay per request, nothing when idle
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+        - { AttributeName: GSI2PK, AttributeType: S }
+        - { AttributeName: GSI2SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1          # newest jobs / backups first
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI2          # jobs by status
+          KeySchema:
+            - { AttributeName: GSI2PK, KeyType: HASH }
+            - { AttributeName: GSI2SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: false          # false = AWS-owned key encryption (still encrypted at rest, no KMS cost)
+
+  # ===========================================================================
+  # Amazon SQS - main job queue + dead-letter queue
+  # ===========================================================================
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      MessageRetentionPeriod: 345600   # 4 days to inspect and redrive
+      SqsManagedSseEnabled: true
+
+  JobsQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      # Must be >= the worker timeout. AWS recommends 6x the function timeout (15 s x 6 = 90 s).
+      VisibilityTimeout: 90
+      MessageRetentionPeriod: 86400    # 1 day
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3             # must equal MAX_ATTEMPTS below
+
+  # ===========================================================================
+  # CloudWatch Logs - explicit log groups so retention is 7 days (default is "never expire")
+  # ===========================================================================
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api'
+      RetentionInDays: 7
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: 7
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-authorizer'
+      RetentionInDays: 7
+  HttpApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete        # demo stack: teardown removes everything (see scripts/teardown.ps1)
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${AWS::StackName}-http-api'
+      RetentionInDays: 7
+
+  # ===========================================================================
+  # AWS Lambda functions (+ least-privilege IAM execution roles created by SAM)
+  # ===========================================================================
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-authorizer'
+      Description: QueuePilot demo-token authorizer for the HTTP API
+      CodeUri: dist/authorizer/
+      MemorySize: 128
+      Timeout: 3
+      LoggingConfig:
+        LogGroup: !Ref AuthorizerLogGroup
+      Environment:
+        Variables:
+          DEMO_TOKEN: !Ref DemoToken
+      # No Policies: the authorizer needs no AWS access (only basic log writing, added by SAM).
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-api'
+      Description: QueuePilot HTTP API (uploads, jobs, retries, DLQ redrive, backups)
+      CodeUri: dist/api/
+      MemorySize: 256
+      Timeout: 10
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref JobsTable
+          DATA_BUCKET: !Ref DataBucket
+          QUEUE_URL: !Ref JobsQueue
+          QUEUE_ARN: !GetAtt JobsQueue.Arn
+          DLQ_URL: !Ref DeadLetterQueue
+          DLQ_ARN: !GetAtt DeadLetterQueue.Arn
+          MAX_ATTEMPTS: '3'
+          WORKER_TIMEOUT_SECONDS: '15'
+          JOB_TTL_DAYS: '7'
+          BACKUP_TTL_DAYS: '30'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: JobsTableReadWrite
+              Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:BatchGetItem, dynamodb:BatchWriteItem, dynamodb:ConditionCheckItem]
+              Resource: [!GetAtt JobsTable.Arn, !Sub '${JobsTable.Arn}/index/*']
+            - Sid: SendJobsAndReadDepth
+              Effect: Allow
+              Action: [sqs:SendMessage, sqs:GetQueueAttributes]
+              Resource: !GetAtt JobsQueue.Arn
+            - Sid: DlqPeekAndRedrive
+              # ReceiveMessage = DLQ preview; StartMessageMoveTask needs Receive/Delete on the source queue.
+              Effect: Allow
+              Action: [sqs:GetQueueAttributes, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:StartMessageMoveTask, sqs:ListMessageMoveTasks]
+              Resource: !GetAtt DeadLetterQueue.Arn
+            - Sid: PresignUploadsAndReadResults
+              Effect: Allow
+              Action: [s3:PutObject, s3:GetObject]
+              Resource: [!Sub '${DataBucket.Arn}/inputs/*', !Sub '${DataBucket.Arn}/backups/*']
+            - Sid: ReadOutputs
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${DataBucket.Arn}/outputs/*'
+            - Sid: ListBucketSoMissingObjectsReturn404
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt DataBucket.Arn
+      Events:
+        Health:         { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /health, Auth: { Authorizer: NONE } } }
+        CreateUpload:   { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /uploads } }
+        CreateJob:      { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /jobs } }
+        ListJobs:       { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /jobs } }
+        GetJob:         { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: '/jobs/{jobId}' } }
+        DeleteJob:      { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: DELETE, Path: '/jobs/{jobId}' } }
+        RetryJob:       { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: '/jobs/{jobId}/retry' } }
+        Metrics:        { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /system/metrics } }
+        DlqMessages:    { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /dlq/messages } }
+        StartRedrive:   { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /dlq/redrive } }
+        RedriveStatus:  { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /dlq/redrive } }
+        CreateBackup:   { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /backups } }
+        ListBackups:    { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /backups } }
+        RestoreBackup:  { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: '/backups/{backupId}/restore' } }
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Description: QueuePilot SQS worker (processes jobs, retries with backoff, dead-letters)
+      CodeUri: dist/worker/
+      MemorySize: 512
+      Timeout: 15
+      LoggingConfig:
+        LogGroup: !Ref WorkerLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref JobsTable
+          DATA_BUCKET: !Ref DataBucket
+          QUEUE_URL: !Ref JobsQueue
+          QUEUE_ARN: !GetAtt JobsQueue.Arn
+          DLQ_URL: !Ref DeadLetterQueue
+          DLQ_ARN: !GetAtt DeadLetterQueue.Arn
+          MAX_ATTEMPTS: '3'
+          BACKOFF_SECONDS: '5,20'
+          WORKER_TIMEOUT_SECONDS: '15'
+          JOB_TTL_DAYS: '7'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: JobRecords
+              Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt JobsTable.Arn
+            - Sid: ReadInputs
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${DataBucket.Arn}/inputs/*'
+            - Sid: WriteOutputs
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${DataBucket.Arn}/outputs/*'
+            - Sid: ListBucketSoMissingObjectsReturn404
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt DataBucket.Arn
+            - Sid: ConsumeJobsQueue
+              Effect: Allow
+              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+              Resource: !GetAtt JobsQueue.Arn
+
+  # The SQS -> Lambda trigger. Declared explicitly (instead of a SAM "SQS" event) so the worker's
+  # SQS permissions can be scoped to this one queue rather than a managed policy on all queues.
+  WorkerQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt JobsQueue.Arn
+      FunctionName: !Ref WorkerFunction
+      BatchSize: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]   # partial batch response
+      ScalingConfig:
+        MaximumConcurrency: 3   # cost/runaway guard without touching account concurrency quotas
+
+  # ===========================================================================
+  # Amazon API Gateway - HTTP API with demo-token authorizer, CORS and throttling
+  # ===========================================================================
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: QueuePilot public API
+      FailOnWarnings: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+      AccessLogSettings:
+        DestinationArn: !GetAtt HttpApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","route":"$context.routeKey","status":"$context.status","latencyMs":"$context.responseLatency","authError":"$context.authorizer.error","integrationError":"$context.integrationErrorMessage"}'
+      CorsConfiguration:
+        AllowOrigins: ['http://localhost:5173', 'http://localhost:4173', !GetAtt WebsiteBucket.WebsiteURL]
+        AllowHeaders: [authorization, content-type, idempotency-key]
+        AllowMethods: [GET, POST, DELETE, OPTIONS]
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: DemoTokenAuthorizer
+        Authorizers:
+          DemoTokenAuthorizer:
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            AuthorizerPayloadFormatVersion: '2.0'
+            EnableSimpleResponses: true
+            EnableFunctionDefaultPermissions: true
+            Identity:
+              Headers: [Authorization]
+              ReauthorizeEvery: 300     # cache decisions for 5 minutes
+
+  # ===========================================================================
+  # Amazon CloudWatch - alarms (+ optional SNS email) and dashboard
+  # ===========================================================================
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref AlarmEmail }
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-not-empty'
+      AlarmDescription: One or more jobs exhausted their retries and are in the dead-letter queue. Inspect them in the Recovery page, fix the cause, then retry or redrive.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt DeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+      OKActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-worker-errors'
+      AlarmDescription: The worker Lambda crashed or timed out (job failures that are handled are NOT Lambda errors).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref WorkerFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+  QueueBacklogAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-queue-backlog-age'
+      AlarmDescription: The oldest job in the main queue has waited more than 5 minutes; workers may be failing or throttled.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{ Name: QueueName, Value: !GetAtt JobsQueue.QueueName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 300
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-api-5xx'
+      AlarmDescription: The API returned 5 or more server errors in 5 minutes.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - { Name: ApiId, Value: !Ref HttpApi }
+        - { Name: Stage, Value: $default }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}'
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+                "properties": { "markdown": "## QueuePilot (${AWS::StackName})\nLive metrics from SQS, Lambda, API Gateway and QueuePilot custom metrics (namespace **QueuePilot**). Alarms turn red here when the DLQ has messages or the worker crashes." } },
+              { "type": "alarm", "x": 0, "y": 2, "width": 24, "height": 3,
+                "properties": { "title": "Alarms", "alarms": ["${DlqAlarmArn}", "${WorkerAlarmArn}", "${BacklogAlarmArn}", "${ApiAlarmArn}"] } },
+              { "type": "metric", "x": 0, "y": 5, "width": 12, "height": 6,
+                "properties": { "title": "Queue depth", "region": "${AWS::Region}", "stat": "Maximum", "period": 60, "view": "timeSeries",
+                  "metrics": [
+                    ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${QueueName}", { "label": "Main queue - waiting" }],
+                    ["AWS/SQS", "ApproximateNumberOfMessagesNotVisible", "QueueName", "${QueueName}", { "label": "Main queue - in flight / backing off" }],
+                    ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${DlqName}", { "label": "Dead-letter queue", "color": "#d62728" }]
+                  ] } },
+              { "type": "metric", "x": 12, "y": 5, "width": 12, "height": 6,
+                "properties": { "title": "Job outcomes (custom EMF metrics)", "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                  "metrics": [
+                    ["QueuePilot", "JobsSubmitted", "Service", "QueuePilot"],
+                    ["QueuePilot", "JobsSucceeded", "Service", "QueuePilot", { "color": "#2ca02c" }],
+                    ["QueuePilot", "JobRetriesScheduled", "Service", "QueuePilot", { "color": "#ff7f0e" }],
+                    ["QueuePilot", "JobsFailed", "Service", "QueuePilot", { "color": "#9467bd" }],
+                    ["QueuePilot", "JobsDeadLettered", "Service", "QueuePilot", { "color": "#d62728" }],
+                    ["QueuePilot", "StaleMessagesDiscarded", "Service", "QueuePilot", { "color": "#7f7f7f" }]
+                  ] } },
+              { "type": "metric", "x": 0, "y": 11, "width": 8, "height": 6,
+                "properties": { "title": "Worker Lambda", "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
+                  "metrics": [
+                    ["AWS/Lambda", "Invocations", "FunctionName", "${WorkerFunction}", { "stat": "Sum" }],
+                    ["AWS/Lambda", "Errors", "FunctionName", "${WorkerFunction}", { "stat": "Sum", "color": "#d62728" }],
+                    ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "${WorkerFunction}", { "stat": "Maximum", "label": "Concurrency (capped at 3)" }]
+                  ] } },
+              { "type": "metric", "x": 8, "y": 11, "width": 8, "height": 6,
+                "properties": { "title": "Durations (ms)", "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
+                  "metrics": [
+                    ["AWS/Lambda", "Duration", "FunctionName", "${WorkerFunction}", { "stat": "p90", "label": "Worker p90" }],
+                    ["QueuePilot", "JobDurationMs", "Service", "QueuePilot", { "stat": "Average", "label": "Job processing avg" }],
+                    ["AWS/Lambda", "Duration", "FunctionName", "${ApiFunction}", { "stat": "p90", "label": "API p90" }]
+                  ] } },
+              { "type": "metric", "x": 16, "y": 11, "width": 8, "height": 6,
+                "properties": { "title": "HTTP API", "region": "${AWS::Region}", "period": 60, "stat": "Sum", "view": "timeSeries",
+                  "metrics": [
+                    ["AWS/ApiGateway", "Count", "ApiId", "${HttpApi}", "Stage", "$default", { "label": "Requests" }],
+                    ["AWS/ApiGateway", "4xx", "ApiId", "${HttpApi}", "Stage", "$default", { "color": "#ff7f0e" }],
+                    ["AWS/ApiGateway", "5xx", "ApiId", "${HttpApi}", "Stage", "$default", { "color": "#d62728" }]
+                  ] } },
+              { "type": "log", "x": 0, "y": 17, "width": 24, "height": 6,
+                "properties": { "title": "Recent worker warnings and errors", "region": "${AWS::Region}", "view": "table",
+                  "query": "SOURCE '${WorkerLogGroup}' | fields @timestamp, level, msg, jobId, attempt, error | filter level in ['warn','error'] | sort @timestamp desc | limit 20" } }
+            ]
+          }
+        - QueueName: !GetAtt JobsQueue.QueueName
+          DlqName: !GetAtt DeadLetterQueue.QueueName
+          DlqAlarmArn: !GetAtt DlqNotEmptyAlarm.Arn
+          WorkerAlarmArn: !GetAtt WorkerErrorsAlarm.Arn
+          BacklogAlarmArn: !GetAtt QueueBacklogAgeAlarm.Arn
+          ApiAlarmArn: !GetAtt Api5xxAlarm.Arn
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the HTTP API
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  WebsiteUrl:
+    Condition: WebsiteEnabled
+    Description: Public URL of the React dashboard (HTTP; S3 static website)
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+  WebsiteBucketName:
+    Value: !Ref WebsiteBucket
+  DataBucketName:
+    Value: !Ref DataBucket
+  JobsTableName:
+    Value: !Ref JobsTable
+  JobsQueueUrl:
+    Value: !Ref JobsQueue
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
+  ApiFunctionName:
+    Value: !Ref ApiFunction
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}'
+  Region:
+    Value: !Ref AWS::Region
