@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Type-check, lint, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check, lint, unit tests and builds
+        run: npm run check
+
+  infrastructure:
+    name: Validate CloudFormation and scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Lint CloudFormation templates (cfn-lint, includes the SAM transform)
+        run: |
+          pip install --quiet cfn-lint
+          cfn-lint --regions us-east-1 -- backend/template.yaml infra/budget.yaml
+
+      - name: Check PowerShell script syntax
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem scripts -Filter *.ps1) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { $failed = $true; $errors | ForEach-Object { Write-Host "::error file=scripts/$($file.Name)::$($_.Message)" } }
+            else { Write-Host "OK  $($file.Name)" }
+          }
+          if ($failed) { exit 1 }
+
+  secrets:
+    name: Scan for committed secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail if credentials or secret files are tracked
+        run: |
+          set -u
+          status=0
+          # Files that must never be committed
+          if git ls-files | grep -E '(^|/)(\.env(\..+)?|e2e\.config\.json|credentials|secrets\.json)$|\.(pem|key|p12|pfx)$' | grep -v '\.env\.example$'; then
+            echo "::error::Secret or machine-specific files are tracked (listed above)."; status=1
+          fi
+          # Credential patterns: AWS access keys, private keys, GitHub/Slack tokens, hard-coded secrets
+          if git grep -nIE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_secret_access_key[[:space:]]*=|-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|xox[abp]-[A-Za-z0-9-]{10,}' -- ':!package-lock.json'; then
+            echo "::error::Possible credentials found (listed above)."; status=1
+          fi
+          [ "$status" -eq 0 ] && echo "No secrets found."
+          exit $status

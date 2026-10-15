@@ -3,6 +3,28 @@
   "private": true,
   "version": "0.1.0",
   "description": "QueuePilot - cloud-native asynchronous file-processing and failure-recovery platform (AWS serverless)",
+  "license": "MIT",
+  "author": "Rajat Jhawar",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/roshanjhawar23/QueuePilot.git"
+  },
+  "homepage": "https://github.com/roshanjhawar23/QueuePilot#readme",
+  "bugs": {
+    "url": "https://github.com/roshanjhawar23/QueuePilot/issues"
+  },
+  "keywords": [
+    "aws",
+    "serverless",
+    "lambda",
+    "sqs",
+    "dead-letter-queue",
+    "dynamodb",
+    "s3",
+    "aws-sam",
+    "react",
+    "typescript"
+  ],
   "workspaces": [
     "shared",
     "backend",

@@ -14,7 +14,7 @@ Total time for a first deployment is about 30–45 minutes, most of it one-time 
 
 Docker is **not** required: the Lambda code is bundled with esbuild, not built in containers.
 
-Open **PowerShell** in `D:\QueuePilot`. If scripts are blocked, allow them for this window only:
+Open **PowerShell** in the folder where you cloned the repository (e.g. `C:\dev\QueuePilot`). If scripts are blocked, allow them for this window only:
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```

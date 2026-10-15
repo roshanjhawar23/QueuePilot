@@ -30,7 +30,7 @@ A handover file: read this first when resuming work, whether by a person or an A
 
 ## Next steps (in order)
 
-1. On Windows in `D:\QueuePilot`: run `npm ci`, then `npm run check`.
+1. In the project folder (the working copy is `C:\dev\QueuePilot`; `D:\QueuePilot` is blocked by Windows Controlled Folder Access): run `npm ci`, then `npm run check`.
 2. Create an IAM Identity Center user, then run `aws configure sso` with profile `queuepilot`.
 3. `.\scripts\preflight.ps1 -Profile queuepilot`
 4. `.\scripts\deploy-budget.ps1 -AlertEmail <email> -Profile queuepilot`

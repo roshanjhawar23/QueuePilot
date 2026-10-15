@@ -1,13 +1,46 @@
+# ---------------------------------------------------------------
+# Dependencies and build output (recreated by `npm ci` / builds)
+# ---------------------------------------------------------------
 node_modules/
 dist/
 coverage/
+*.tsbuildinfo
+.vite/
 .aws-sam/
-*.log
+
+# ---------------------------------------------------------------
+# Secrets and machine-specific configuration - NEVER commit these
+# ---------------------------------------------------------------
 .env
 .env.*
 !.env.example
-frontend/.env.local
-backend/samconfig.local.toml
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+credentials
+secrets.json
+# Written by scripts/deploy-backend.ps1 (contains the API URL only, but is per-deployment)
 backend/e2e.config.json
+# Personal SAM overrides
+backend/samconfig.local.toml
+
+# ---------------------------------------------------------------
+# Logs and temporary files
+# ---------------------------------------------------------------
+*.log
+npm-debug.log*
+.wtest
+*.tmp
+
+# ---------------------------------------------------------------
+# Editors and operating systems
+# ---------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
 .DS_Store
 Thumbs.db
+desktop.ini
