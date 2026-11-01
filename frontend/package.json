@@ -16,7 +16,7 @@
     "@queuepilot/shared": "0.1.0",
     "react": "^19.1.9",
     "react-dom": "^19.1.9",
-    "react-router-dom": "^7.9.0"
+    "react-router-dom": "^7.18.5"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.10.0",
